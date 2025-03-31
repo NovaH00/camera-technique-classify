@@ -5,63 +5,75 @@ import numpy as np
 import argparse
 from PIL import Image
 from torchvision import transforms
-from model import TimeSFormer  # Changed from VideoClassify to TimeSFormer
+from model import TimeSFormer
 import time
+import json
+from pathlib import Path
 
-
-
-def load_model(model_path, num_classes=5, frames=64):  # Changed default frames to 64 to match TimeSFormer
+def load_model(model_path, num_classes=5, frames=None):
     """
     Load a trained model from checkpoint.
     
     Args:
         model_path (str): Path to the model file
         num_classes (int): Number of classes the model was trained on
-        frames (int): Number of frames the model expects
+        frames (int, optional): Number of frames the model expects. If None, will try to detect from checkpoint.
         
     Returns:
-        tuple: (model, device, class_map)
+        tuple: (model, device, class_map, num_frames)
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Initialize the model
-    model = TimeSFormer(number_of_frames=frames, num_classes=num_classes)  # Updated parameters to match TimeSFormer
-    
-    # Load model
+    # Load checkpoint first to extract metadata
     if os.path.isfile(model_path):
         print(f"Loading model from {model_path}")
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        
+        # Try to determine frame count from checkpoint
+        detected_frames = None
+        if 'num_frames' in checkpoint:
+            detected_frames = checkpoint['num_frames']
+            print(f"Detected frame count from checkpoint: {detected_frames}")
+        
+        # Use detected frame count, command line argument, or default
+        num_frames = frames if frames is not None else (detected_frames if detected_frames is not None else 64)
+        print(f"Using {num_frames} frames for model initialization")
+        
+        # Initialize the model with the correct frame count
+        model = TimeSFormer(number_of_frames=num_frames, num_classes=num_classes)
         
         # Extract class_map from checkpoint if available
         class_map = None
         if 'metrics' in checkpoint and 'class_map' in checkpoint['metrics']:
             class_map = checkpoint['metrics']['class_map']
-            print("Found class map in checkpoint metrics:", class_map)
         elif 'class_map' in checkpoint:
             original_class_map = checkpoint['class_map']
-            print("Raw class map from checkpoint:", original_class_map)
             
             # Convert to idx -> name format if necessary
             if all(isinstance(k, str) for k in original_class_map.keys()) and all(isinstance(v, int) for v in original_class_map.values()):
-                # Invert the map to have indices as keys and class names as values
                 class_map = {v: k for k, v in original_class_map.items()}
-                print("Converted class map (idx -> name):", class_map)
             else:
                 class_map = original_class_map
         else:
-            print("No class map found in checkpoint, using default class map.")
-            class_map = {
-                "0": "dolly",
-                "1": "pan",
-                "2": "tilt",
-                "3": "tracking",
-                "4": "zoom"
-            }
+            # Try to load class mapping from standard location
+            class_mapping_file = os.path.join(os.path.dirname(os.path.dirname(model_path)), 'class_mapping.json')
+            if os.path.exists(class_mapping_file):
+                with open(class_mapping_file, 'r') as f:
+                    class_map = json.load(f)
+                print(f"Loaded class mapping from {class_mapping_file}")
+            else:
+                print("No class map found in checkpoint or external file, using default.")
+                class_map = {
+                    "0": "dolly",
+                    "1": "pan",
+                    "2": "tilt",
+                    "3": "tracking",
+                    "4": "zoom"
+                }
             
         # Load state dict from checkpoint
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
-            # Fix the formatting error by checking if best_val_acc exists and is a number
             if 'best_val_acc' in checkpoint and isinstance(checkpoint['best_val_acc'], (int, float)):
                 print(f"Model loaded successfully. Best validation accuracy: {checkpoint['best_val_acc']:.4f}")
             else:
@@ -74,7 +86,7 @@ def load_model(model_path, num_classes=5, frames=64):  # Changed default frames 
     
     model.to(device)
     model.eval()
-    return model, device, class_map
+    return model, device, class_map, num_frames
 
 def preprocess_frame(frame, transform=None):
     """
@@ -156,7 +168,7 @@ def sample_frames(video_path, num_frames=75):
     cap.release()
     return frames
 
-def run_inference(model, video_path, device, class_map=None, frames=75):
+def run_inference(model, video_path, device, class_map=None, frames=None):
     """
     Run inference on a video file.
     
@@ -165,7 +177,7 @@ def run_inference(model, video_path, device, class_map=None, frames=75):
         video_path (str): Path to the video file
         device: PyTorch device
         class_map (dict): Mapping from class index to class name
-        frames (int): Number of frames to sample
+        frames (int): Number of frames to sample, should match model's expected frame count
         
     Returns:
         tuple: (predicted_class_idx, prediction_scores)
@@ -179,6 +191,10 @@ def run_inference(model, video_path, device, class_map=None, frames=75):
             3: "tracking", 
             4: "zoom"
         }
+    
+    # Ensure frames parameter is appropriate for the model
+    if frames is None:
+        raise ValueError("The number of frames must be specified to match the model's expectations")
     
     # Sample frames from video
     print(f"Sampling {frames} frames from video...")
@@ -196,11 +212,15 @@ def run_inference(model, video_path, device, class_map=None, frames=75):
         # Handle both possible input formats
         try:
             outputs = model(inputs)
-        except:
-            # Try transposing dimensions if regular input fails
-            # Some models expect (B, C, T, H, W) format
-            inputs_alt = inputs.transpose(1, 2)  # [1, C, T, H, W]
-            outputs = model(inputs_alt)
+        except Exception as e:
+            print(f"Error with original input format: {e}")
+            try:
+                # Try transposing dimensions if regular input fails
+                inputs_alt = inputs.transpose(1, 2)  # [1, C, T, H, W]
+                outputs = model(inputs_alt)
+            except Exception as e2:
+                print(f"Error with alternative input format: {e2}")
+                raise ValueError(f"Model could not process input tensor. Check frame count and tensor format. Original error: {e}")
         
         probabilities = torch.nn.functional.softmax(outputs, dim=1)[0]
         
@@ -371,7 +391,7 @@ def main():
     parser.add_argument('--model', type=str, default='./output/checkpoints/best_model/checkpoint_epoch_39.pth', 
                         help='Path to the model checkpoint')
     parser.add_argument('--num_classes', type=int, default=5, help='Number of classes')
-    parser.add_argument('--frames', type=int, default=64, help='Number of frames to sample')
+    parser.add_argument('--frames', type=int, default=None, help='Number of frames to sample (if None, will detect from model)')
     parser.add_argument('--output', type=str, help='Path to save the output video')
     parser.add_argument('--visualize', action='store_true', help='Visualize the results')
     parser.add_argument('--true_class', type=str, help='True class name for evaluation')
@@ -380,17 +400,31 @@ def main():
     
     args = parser.parse_args()
     
-    # Load model and get class map from checkpoint
-    model, device, class_map = load_model(args.model, num_classes=args.num_classes, frames=args.frames)
+    # Load model and get frame count
+    model, device, class_map, num_frames = load_model(
+        args.model, 
+        num_classes=args.num_classes, 
+        frames=args.frames
+    )
+    
+    # Use detected frame count if not specified on command line
+    frames_to_use = args.frames if args.frames is not None else num_frames
+    print(f"Using {frames_to_use} frames for inference")
     
     # Run inference
-    predicted_class, probabilities = run_inference(model, args.video, device, class_map=class_map, frames=args.frames)
+    predicted_class, probabilities = run_inference(
+        model, 
+        args.video, 
+        device, 
+        class_map=class_map, 
+        frames=frames_to_use
+    )
     
     # Visualize result if requested
     if args.visualize or args.output:
         visualize_result(args.video, predicted_class, probabilities=probabilities, 
-                         class_map=class_map, output_path=args.output,
-                         true_class=args.true_class, resize_factor=args.resize)
+                        class_map=class_map, output_path=args.output,
+                        true_class=args.true_class, resize_factor=args.resize)
 
 if __name__ == "__main__":
     main()

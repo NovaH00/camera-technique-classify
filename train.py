@@ -8,19 +8,17 @@ from pathlib import Path
 import json
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import multiprocessing
 
 
 from model import TimeSFormer
-from dataset import create_dataloader
+from tensor_dataset import TensorVideoDataset
 
 # Configuration dictionary
 CONFIG = {
     # Data parameters
-    "data_dir": "dataset",  # Directory containing video data
+    "data_dir": "tensor_dataset",  # Directory containing tensor data
     "output_dir": "output",  # Output directory for logs and checkpoints
-    "num_frames": 64,  # Number of frames to sample from each video
-    "train_ratio": 0.8,  # Ratio of data to use for training
-    "video_extensions": ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.MOV"],  # Video file extensions to look for
     
     # Training parameters
     "batch_size": 4,  # Training batch size
@@ -30,12 +28,63 @@ CONFIG = {
     "weight_decay": 1e-4,  # Weight decay coefficient
     "save_every": 5,  # Save checkpoint every N epochs
     
+    # Data loading optimization parameters
+    "num_workers": None,  # Will be set automatically based on CPU count
+    "prefetch_factor": 2,  # Number of batches loaded in advance by each worker
+    "persistent_workers": True,  # Keep workers alive between data loader iterations
+    "pin_memory": True,  # Use pinned memory for faster CPU->GPU transfer
+    
     # Other parameters
     "seed": 42,  # Random seed
-    "num_workers": 4,  # Number of data loading workers
     "no_cuda": False,  # Disable CUDA
 }
 
+# Automatically determine optimal number of workers if not specified
+if CONFIG["num_workers"] is None:
+    CONFIG["num_workers"] = min(4 * torch.cuda.device_count() if torch.cuda.is_available() else 1, 
+                               multiprocessing.cpu_count())
+
+def create_optimized_dataloaders(data_dir, batch_size, num_workers, config):
+    """
+    Create optimized data loaders with advanced settings for better performance.
+    
+    Args:
+        data_dir: Directory containing tensor data
+        batch_size: Batch size
+        num_workers: Number of worker processes
+        config: Configuration dictionary with additional optimization parameters
+        
+    Returns:
+        train_loader, val_loader, class_mapping
+    """
+    # Create datasets
+    train_dataset = TensorVideoDataset(data_dir, split="train")
+    val_dataset = TensorVideoDataset(data_dir, split="val")
+    
+    # Create optimized dataloaders
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=min(batch_size, len(train_dataset)),
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=config.get("pin_memory", True),
+        prefetch_factor=config.get("prefetch_factor", 2),
+        persistent_workers=config.get("persistent_workers", True) if num_workers > 0 else False,
+        drop_last=True if len(train_dataset) > batch_size else False
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=min(batch_size, len(val_dataset)),
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=config.get("pin_memory", True),
+        prefetch_factor=config.get("prefetch_factor", 2),
+        persistent_workers=config.get("persistent_workers", True) if num_workers > 0 else False,
+        drop_last=False
+    )
+    
+    return train_loader, val_loader, train_dataset.class_mapping
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
     """Train the model for one epoch."""
@@ -48,11 +97,11 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
     
     for videos, labels in progress_bar:
         # Move data to device
-        videos = videos.to(device)  # Expects shape (B, T, C, H, W)
-        labels = labels.to(device)
+        videos = videos.to(device, non_blocking=True)  # Use non_blocking for async transfer
+        labels = labels.to(device, non_blocking=True)
         
         # Forward pass
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
         outputs = model(videos)
         loss = criterion(outputs, labels)
         
@@ -90,8 +139,8 @@ def validate(model, dataloader, criterion, device):
         
         for videos, labels in progress_bar:
             # Move data to device
-            videos = videos.to(device)
-            labels = labels.to(device)
+            videos = videos.to(device, non_blocking=True)  # Use non_blocking for async transfer
+            labels = labels.to(device, non_blocking=True)
             
             # Forward pass
             outputs = model(videos)
@@ -144,11 +193,14 @@ def main(config):
     # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() and not config["no_cuda"] else 'cpu')
     print(f"Using device: {device}")
+    print(f"Using {config['num_workers']} data loading workers")
     
     # Set random seed for reproducibility
     torch.manual_seed(config["seed"])
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config["seed"])
+        # Set CUDA optimization options
+        torch.backends.cudnn.benchmark = True  # Optimize CUDA operations for fixed input sizes
     
     # Create output directories
     output_dir = Path(config["output_dir"])
@@ -170,16 +222,26 @@ def main(config):
     writer = SummaryWriter(log_dir)
     
     try:
-        # Create data loaders - add back the video_extensions parameter
-        train_loader, val_loader, idx_to_class = create_dataloader(
+        # First, determine number of frames from a sample tensor file
+        temp_dataset = TensorVideoDataset(config["data_dir"], split="train")
+        if len(temp_dataset) == 0:
+            raise ValueError("No training samples found in dataset")
+        
+        # Get first sample to determine frame count
+        sample_tensor, _ = temp_dataset[0]
+        num_frames = sample_tensor.shape[0]  # T from (T, C, H, W)
+        print(f"Detected {num_frames} frames in tensor dataset")
+        
+        # Create optimized data loaders
+        train_loader, val_loader, class_mapping = create_optimized_dataloaders(
             config["data_dir"],
             batch_size=config["batch_size"],
-            num_frames=config["num_frames"],
             num_workers=config["num_workers"],
-            train_ratio=config["train_ratio"],
-            frame_size=(224, 224),
-            video_extensions=config["video_extensions"]  # Pass the video extensions from CONFIG
+            config=config
         )
+        
+        # Convert class mapping format if needed
+        idx_to_class = {int(k): v for k, v in class_mapping.items()} if isinstance(next(iter(class_mapping.keys())), str) else class_mapping
         
         # Save class mapping
         with open(output_dir / 'class_mapping.json', 'w') as f:
@@ -189,9 +251,9 @@ def main(config):
         print(f"Number of validation batches: {len(val_loader)}")
         print(f"Class mapping: {idx_to_class}")
         
-        # Initialize model
+        # Initialize model with the detected frame count
         num_classes = len(idx_to_class)
-        model = TimeSFormer(number_of_frames=config["num_frames"], num_classes=num_classes)
+        model = TimeSFormer(number_of_frames=num_frames, num_classes=num_classes)
         model = model.to(device)
         
         # Define loss function and optimizer
@@ -201,15 +263,60 @@ def main(config):
         # Learning rate scheduler
         scheduler = CosineAnnealingLR(optimizer, T_max=config["epochs"], eta_min=config["min_lr"])
         
+        # Enable automatic mixed precision for faster training when using GPU
+        scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+        
         # Track best model
         best_val_acc = 0.0
         
         # Training loop
         for epoch in range(config["epochs"]):
-            # Train for one epoch
-            train_loss, train_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, device, epoch
-            )
+            # Train with AMP when using GPU
+            model.train()
+            running_loss = 0.0
+            correct = 0
+            total = 0
+            
+            progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1} [Train]')
+            
+            for videos, labels in progress_bar:
+                # Move data to device
+                videos = videos.to(device, non_blocking=True)  # Use non_blocking for async transfer
+                labels = labels.to(device, non_blocking=True)
+                
+                # Forward pass with mixed precision when using GPU
+                optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+                
+                if scaler is not None:
+                    # Fix the deprecation warning by using torch.amp.autocast instead
+                    with torch.amp.autocast(device_type='cuda'):
+                        outputs = model(videos)
+                        loss = criterion(outputs, labels)
+                    
+                    # Backward pass with scaled gradients
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    outputs = model(videos)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+                
+                # Track metrics
+                running_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    'loss': running_loss / (progress_bar.n + 1),
+                    'acc': 100. * correct / total
+                })
+            
+            train_loss = running_loss / len(train_loader)
+            train_acc = 100. * correct / total
             
             # Validate
             val_metrics = validate(model, val_loader, criterion, device)
